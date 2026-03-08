@@ -1,27 +1,29 @@
 import os
 import argparse
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionXLPipeline
+from peft import LoraConfig, set_peft_model_state_dict
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 os.environ['HF_ENDPOINT'] = "https://hf-mirror.com"
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate with single-style LoRA")
+    parser = argparse.ArgumentParser(description="Generate with single-style LoRA for SDXL")
 
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="runwayml/stable-diffusion-v1-5",
-        help="预训练模型路径"
+        default="stabilityai/stable-diffusion-xl-base-1.0",
+        help="预训练模型路径（SDXL）"
     )
 
     parser.add_argument(
         "--lora_root",
         type=str,
-        default="lora_weights",
+        default="./lora_weights",
         help="LoRA权重根目录"
     )
 
@@ -50,7 +52,7 @@ def parse_args():
     parser.add_argument(
         "--num_inference_steps",
         type=int,
-        default=80,
+        default=40,
         help="推理步数"
     )
 
@@ -64,7 +66,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=1024,  # SDXL默认1024
         help="生成图像分辨率"
     )
 
@@ -73,6 +75,20 @@ def parse_args():
         type=int,
         default=42,
         help="随机种子"
+    )
+
+    # LoRA参数（必须和训练时一致）
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=16,
+        help="LoRA秩的大小（必须和训练时一致）"
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=32,
+        help="LoRA缩放因子（必须和训练时一致）"
     )
 
     return parser.parse_args()
@@ -91,38 +107,27 @@ def main():
     output_dir = os.path.join(args.output_dir, args.style)
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 加载基础模型
-    logger.info("加载基础模型...")
-    pipe = StableDiffusionPipeline.from_pretrained(
+    # 1. 加载基础模型（SDXL）
+    print("加载SDXL基础模型...")
+
+    # SDXL需要特殊的加载方式
+    pipe = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        variant="fp16" if torch.cuda.is_available() else None,
+        use_safetensors=True,
     )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 2. 加载LoRA权重
-    lora_path = os.path.join(args.lora_root, args.style)
-    os.makedirs(lora_path, exist_ok=True)
-
-    try:
-        logger.info(f"加载LoRA从: {lora_path}")
-        combined_dict = torch.load(os.path.join(lora_path, "pytorch_lora_weights.bin"), map_location=device)
-
-        # 分别获取UNet和文本编码器的权重
-        unet_state_dict = combined_dict["unet"]
-        text_encoder_state_dict = combined_dict["text_encoder"]
-
-        # 加载到UNet,文本编码器
-        pipe.unet.load_state_dict(unet_state_dict)
-        pipe.text_encoder.load_state_dict(text_encoder_state_dict)
-
-        logger.info("LoRA权重加载成功")
-
-    except Exception as e:
-        logger.error(f"❌ LoRA加载失败: {e}")
 
     # 3. 移动模型到设备
     pipe = pipe.to(device)
-    if device.type == "cpu":
+
+    # 启用内存优化
+    if device.type == "cuda":
+        pipe.enable_model_cpu_offload()
+        pipe.enable_vae_slicing()
+    else:
         pipe.enable_attention_slicing()
 
     # 4. 准备生成
@@ -132,19 +137,19 @@ def main():
     seed_dict = {}
 
     for i, prompt_base in enumerate(args.prompts):
-        # 为每个提示词使用不同的种子（基于基础种子）
+        # 为每个提示词使用不同的种子
         current_seed = args.seed + i
         set_seed(current_seed)
         seed_dict[prompt_base] = current_seed
 
         # 构建完整提示词
         full_prompt = f"{prompt_base} in {args.style} style"
-        logger.info(f"生成 {i + 1}/{len(args.prompts)}: {full_prompt}")
+        print(f"生成 {i + 1}/{len(args.prompts)}: {full_prompt}")
 
         # 生成图像
         with torch.no_grad():
             image = pipe(
-                full_prompt,
+                prompt=full_prompt,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
                 height=args.resolution,
@@ -154,6 +159,9 @@ def main():
         # 保存图像
         output_path = os.path.join(output_dir, f"{prompt_base}.png")
         image.save(output_path)
+
+    logger.info(f"所有图像生成完成！")
+
 
 if __name__ == "__main__":
     main()
