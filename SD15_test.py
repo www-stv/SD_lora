@@ -1,17 +1,13 @@
 import os
 import argparse
+from pathlib import Path
 import torch
 from diffusers import StableDiffusionPipeline
-from peft import LoraConfig, set_peft_model_state_dict
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 os.environ['HF_ENDPOINT'] = "https://hf-mirror.com"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate with single-style LoRA")
+    parser = argparse.ArgumentParser(description="Generate with style LoRA + TI")
 
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -19,79 +15,124 @@ def parse_args():
         default="runwayml/stable-diffusion-v1-5",
         help="预训练模型路径"
     )
-
     parser.add_argument(
-        "--lora_root",
+        "--style_name",
         type=str,
-        default="lora_weights",
+        required=True,
+        help="要使用的风格名称"
+    )
+    parser.add_argument(
+        "--lora_dir",
+        type=str,
+        default=None,
         help="LoRA权重根目录"
     )
-
     parser.add_argument(
-        "--style",
+        "--ti_path",
         type=str,
-        default="00",
-        help="要使用的风格文件夹名称"
+        default=None,
+        help="Textual Inversion嵌入路径"
     )
-
     parser.add_argument(
         "--prompts",
         type=str,
         nargs="+",
-        default=["a cat", "a glasses", "a dog"],
+        required=True,
         help="生成提示词列表"
     )
-
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./test_outputs",
+        required=True,
         help="输出目录"
     )
-
     parser.add_argument(
         "--num_inference_steps",
         type=int,
-        default=40,
+        default=50,
         help="推理步数"
     )
-
     parser.add_argument(
         "--guidance_scale",
         type=float,
         default=7.5,
         help="引导比例"
     )
-
     parser.add_argument(
         "--resolution",
         type=int,
         default=512,
         help="生成图像分辨率"
     )
-
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="随机种子"
     )
-
-    # 添加LoRA参数（必须和训练时一致）
     parser.add_argument(
         "--rank",
         type=int,
-        default=16,
+        default=4,
         help="LoRA秩的大小（必须和训练时一致）"
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
-        default=16,
+        default=4,
         help="LoRA缩放因子（必须和训练时一致）"
     )
 
     return parser.parse_args()
+
+
+def load_ti_embedding(pipe, ti_path):
+    # 加载TI嵌入文件
+    ti_data = torch.load(ti_path, map_location="cpu")
+
+    # 获取token和嵌入向量
+    style_token = ti_data.get('style_token', None)
+    embedding = ti_data.get('embedding', None)
+
+    if style_token is None or embedding is None:
+        print("警告: TI文件格式不正确，将不使用TI")
+        return None, None
+
+    # 获取tokenizer和text_encoder
+    tokenizer = pipe.tokenizer
+    text_encoder = pipe.text_encoder
+
+    # 检查token是否已存在
+    if style_token not in tokenizer.get_vocab():
+        # 添加新token
+        num_added_tokens = tokenizer.add_tokens([style_token])
+        print(f"添加新token '{style_token}'，新增数量: {num_added_tokens}")
+
+        # 调整text_encoder的嵌入层大小
+        old_embeddings = text_encoder.get_input_embeddings()
+        new_embeddings = torch.nn.Embedding(
+            old_embeddings.num_embeddings + num_added_tokens,
+            old_embeddings.embedding_dim
+        )
+
+        # 复制原有权重
+        with torch.no_grad():
+            new_embeddings.weight.data[:-num_added_tokens] = old_embeddings.weight.data
+            # 设置新token的嵌入
+            new_embeddings.weight.data[-num_added_tokens:] = embedding.to(old_embeddings.weight.dtype)
+
+        text_encoder.set_input_embeddings(new_embeddings)
+        print(f"已加载TI嵌入 '{style_token}'")
+    else:
+        # 如果token已存在，则更新
+        token_id = tokenizer.convert_tokens_to_ids(style_token)
+        with torch.no_grad():
+            text_encoder.get_input_embeddings().weight[token_id] = embedding.to(
+                text_encoder.get_input_embeddings().weight.dtype
+            )
+        print(f"已更新token '{style_token}' 的嵌入")
+
+    return style_token, tokenizer.convert_tokens_to_ids(style_token)
 
 
 def set_seed(seed):
@@ -100,119 +141,73 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def load_lora_to_pipe(pipe, lora_path, rank=16, lora_alpha=16, device="cpu"):
-    # 1. 加载保存的权重
-    combined_dict = torch.load(os.path.join(lora_path, "pytorch_lora_weights.bin"), map_location=device)
-
-    # 2. 为UNet添加LoRA适配器
-    unet_lora_config = LoraConfig(
-        r=rank,
-        lora_alpha=lora_alpha,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0", "ff.net.0.proj"],
-    )
-    pipe.unet.add_adapter(unet_lora_config)
-
-    # 3. 为文本编码器添加LoRA适配器
-    text_encoder_lora_config = LoraConfig(
-        r=rank,
-        lora_alpha=lora_alpha,
-        init_lora_weights="gaussian",
-        target_modules=["k_proj", "q_proj", "v_proj", "out_proj"],
-    )
-    pipe.text_encoder.add_adapter(text_encoder_lora_config)
-
-    # 4. 加载LoRA权重
-    unet_state_dict = combined_dict["unet"]
-    text_encoder_state_dict = combined_dict["text_encoder"]
-
-    # 使用PEFT的工具函数加载权重
-    set_peft_model_state_dict(pipe.unet, unet_state_dict)
-    set_peft_model_state_dict(pipe.text_encoder, text_encoder_state_dict)
-
-    logger.info("✅ LoRA权重成功加载到适配器")
-    return pipe
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
 
-    output_dir = os.path.join(args.output_dir, args.style)
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. 加载基础模型
-    logger.info("加载基础模型...")
+    print("加载基础模型...")
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch.float32,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
 
-    # 2. 加载LoRA权重
-    lora_path = os.path.join(args.lora_root, args.style)
+    # 2. 加载TI嵌入
+    style_token = None
+    if args.ti_path:
+        style_token, _ = load_ti_embedding(pipe, args.ti_path)
+        print(f"TI token: {style_token}")
 
-    try:
-        pipe.load_lora_weights(lora_path)
-        logger.info(f"✅ Diffusers成功加载LoRA权重: {lora_path}")
-
-    except Exception as e:
-        safetensors_path = os.path.join(lora_path, "pytorch_lora_weights.safetensors")
-        bin_path = os.path.join(lora_path, "pytorch_lora_weights.bin")
-
+    # 3. 加载LoRA权重
+    if args.lora_dir:
         try:
-            if os.path.exists(safetensors_path):
-                logger.info(f"找到safetensors文件: {safetensors_path}")
-                from safetensors.torch import load_file
-                lora_state_dict = load_file(safetensors_path)
-            elif os.path.exists(bin_path):
-                logger.info(f"找到bin文件: {bin_path}")
-                lora_state_dict = torch.load(bin_path, map_location="cpu")
-            else:
-                logger.error("未找到任何权重文件")
-                return
+            pipe.load_lora_weights(Path(args.lora_dir))
+            print(f"✅ 成功加载LoRA权重")
+        except Exception as e:
+            print(f"❌ LoRA加载失败: {e}")
 
-            from diffusers.utils import convert_state_dict_to_diffusers
-            pipe.unet.load_state_dict(convert_state_dict_to_diffusers(lora_state_dict), strict=False)
-            logger.info("✅ 手动加载LoRA成功")
-        except Exception as e2:
-            logger.error(f"❌ 手动加载也失败: {e2}")
-            return
-
-    # 3. 移动模型到设备
+    # 4. 移动模型到设备
     pipe = pipe.to(device)
     if device.type == "cpu":
         pipe.enable_attention_slicing()
 
-    # 4. 准备生成
-    logger.info("开始生成图像...")
-
-    # 记录种子用于复现
-    seed_dict = {}
+    # 5. 准备生成
+    print("开始生成图像...")
 
     for i, prompt_base in enumerate(args.prompts):
         # 为每个提示词使用不同的种子（基于基础种子）
         current_seed = args.seed + i
         set_seed(current_seed)
-        seed_dict[prompt_base] = current_seed
 
         # 构建完整提示词
-        full_prompt = f"{prompt_base} in {args.style} style"
-        logger.info(f"生成 {i + 1}/{len(args.prompts)}: {full_prompt}")
+        if style_token:
+            full_prompt = f"{prompt_base} in {style_token} style"
+        else:
+            full_prompt = f"{prompt_base} in {args.style_name} style"
+
+        print(f"生成 {full_prompt}")
 
         # 生成图像
         with torch.no_grad():
-            image = pipe(
+            result = pipe(
                 full_prompt,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
                 height=args.resolution,
                 width=args.resolution,
-            ).images[0]
+            )
+            image = result.images[0]
 
         # 保存图像
-        output_path = os.path.join(output_dir, f"{prompt_base}.png")
+        safe_filename = prompt_base.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        output_path = output_dir / f"{safe_filename}.png"
         image.save(output_path)
+
 
 if __name__ == "__main__":
     main()
