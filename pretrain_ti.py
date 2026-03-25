@@ -256,7 +256,7 @@ def main():
                 'embedding': token_embeds.weight[style_token_id].detach().cpu(),
             }, save_path / "pretrained_ti_embedding.pt")
 
-            info_path = os.path.join(output_dir, "pretrained_ti_info.txt")
+            info_path = os.path.join(save_path, "pretrained_ti_info.txt")
             with open(info_path, "w") as f:
                 f.write(f"epoch: {epoch + 1}\n")
                 f.write(f"loss: {avg_loss:.6f}\n")

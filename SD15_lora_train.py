@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument(
         "--num_train_epochs",
         type=int,
-        default=200,
+        default=100,
         help="训练轮数"
     )
 
@@ -121,7 +121,7 @@ def parse_args():
     parser.add_argument(
         "--unet_lr",
         type=float,
-        default=5e-4,
+        default=2e-4,
         help="UNet学习率"
     )
     parser.add_argument(

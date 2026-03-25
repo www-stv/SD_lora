@@ -10,6 +10,3 @@ diffusers>=0.25.0
 transformers>=4.30.0
 accelerate>=0.25.0
 peft>=0.7.0
-
-# Optional: for better performance
-xformers>=0.0.20  # For memory-efficient attention

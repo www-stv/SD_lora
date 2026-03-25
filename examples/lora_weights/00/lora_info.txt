@@ -1,0 +1,28 @@
+epoch: 60
+loss: 0.176111
+
+训练参数:
+  pretrained_model_name_or_path: runwayml/stable-diffusion-v1-5
+  style_name: 00
+  instance_dir: ./train_images/00
+  output_dir: ./lora_weights/00
+  resolution: 512
+  train_batch_size: 1
+  num_train_epochs: 200
+  class_dir: ./class_images
+  diverse_loss_weight: 0.5
+  matched_loss_weight: 0.1
+  pretrained_ti_path: ./ti_weights/00/epoch200/pretrained_ti_embedding.pt
+  train_ti: True
+  ti_lr: 0.0005
+  ti_reg_weight: 0.0001
+  unet_lr: 0.0005
+  rank: 4
+  lora_alpha: 4
+  use_orthogonal: True
+  orthogonal_loss_weight: 0.01
+  seed: 42
+  lr_scheduler: cosine
+  gradient_accumulation_steps: 3
+  max_grad_norm: 1.0
+  noise_offset: 0.1
